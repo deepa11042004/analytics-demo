@@ -16,7 +16,7 @@ app.get('/', (req, res) => {
 //test
 app.get('/analytics/overview', (req, res) => {
   res.json({
-    totalUsers: 15483,
+    totalUsers: 25483,
     activeSessions: 342,
     pageViewsToday: 8921,
     bounceRate: 24.3,
