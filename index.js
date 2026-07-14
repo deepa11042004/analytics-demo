@@ -13,7 +13,7 @@ app.get('/', (req, res) => {
     endpoints: ['/analytics/overview', '/analytics/events'],
   })
 })
-//tes
+//test
 app.get('/analytics/overview', (req, res) => {
   res.json({
     totalUsers: 15483,
