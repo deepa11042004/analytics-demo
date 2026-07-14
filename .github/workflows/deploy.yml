@@ -50,48 +50,50 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      # ── 4. Get EC2 instance ID from the frontend stack ───
-      - name: Get EC2 instance ID
-        id: get-instance
+      # ── 4. Get ASG name from the frontend stack ───────────
+      - name: Get ASG name
+        id: get-asg
         run: |
-          INSTANCE_ID=$(aws cloudformation describe-stacks \
+          ASG_NAME=$(aws cloudformation describe-stacks \
             --stack-name ${{ env.FRONTEND_STACK }} \
-            --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' \
+            --query 'Stacks[0].Outputs[?OutputKey==`AutoScalingGroupName`].OutputValue' \
             --output text)
-          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          echo "EC2 Instance ID: $INSTANCE_ID"
+          echo "asg_name=$ASG_NAME" >> $GITHUB_OUTPUT
+          echo "ASG: $ASG_NAME"
 
-      # ── 5. Wait for SSM agent to come online ─────────────
+      # ── 5. Wait for an InService instance to have SSM online ──
       - name: Wait for SSM agent
         run: |
-          INSTANCE_ID="${{ steps.get-instance.outputs.instance_id }}"
-          echo "Waiting for SSM agent on $INSTANCE_ID..."
-
+          ASG_NAME="${{ steps.get-asg.outputs.asg_name }}"
           for i in $(seq 1 20); do
-            STATUS=$(aws ssm describe-instance-information \
-              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-              --query 'InstanceInformationList[0].PingStatus' \
-              --output text 2>/dev/null || echo "None")
+            INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$ASG_NAME" \
+              --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+              --output text | awk '{print $1}')
 
-            echo "Attempt $i — SSM status: $STATUS"
-
-            if [ "$STATUS" = "Online" ]; then
-              echo "SSM agent is online"
-              break
+            if [ -n "$INSTANCE_ID" ]; then
+              STATUS=$(aws ssm describe-instance-information \
+                --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+                --query 'InstanceInformationList[0].PingStatus' \
+                --output text 2>/dev/null || echo "None")
+              echo "Attempt $i — $INSTANCE_ID SSM: $STATUS"
+              if [ "$STATUS" = "Online" ]; then break; fi
+            else
+              echo "Attempt $i — No InService instances yet"
             fi
 
-            [ "$i" = "20" ] && { echo "SSM agent did not come online in time"; exit 1; }
+            [ "$i" = "20" ] && { echo "Timed out waiting for SSM"; exit 1; }
             sleep 15
           done
 
-      # ── 6. Pull latest image and restart analytics container ──
-      - name: Deploy analytics container on EC2
+      # ── 6. Pull latest image and restart analytics on all instances ──
+      - name: Deploy analytics container on all ASG instances
         run: |
-          INSTANCE_ID="${{ steps.get-instance.outputs.instance_id }}"
+          ASG_NAME="${{ steps.get-asg.outputs.asg_name }}"
           IMAGE="${{ env.DOCKER_IMAGE }}:latest"
 
           CMD_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=$ASG_NAME" \
             --document-name "AWS-RunShellScript" \
             --comment "Deploy nexus-analytics ${{ github.sha }}" \
             --parameters "commands=[
@@ -100,7 +102,7 @@ jobs:
               \"docker stop nexus-analytics || true\",
               \"docker rm   nexus-analytics || true\",
               \"docker run -d --name nexus-analytics -p 3002:3002 --restart unless-stopped $IMAGE\",
-              \"echo Analytics service updated\"
+              \"echo Analytics updated\"
             ]" \
             --query 'Command.CommandId' \
             --output text)
@@ -108,27 +110,23 @@ jobs:
           echo "Command ID: $CMD_ID"
 
           for i in $(seq 1 24); do
-            STATUS=$(aws ssm get-command-invocation \
+            STATUSES=$(aws ssm list-command-invocations \
               --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query 'Status' \
-              --output text 2>/dev/null || echo "Pending")
+              --query 'CommandInvocations[*].Status' \
+              --output text 2>/dev/null || echo "")
 
-            echo "  Attempt $i — $STATUS"
+            echo "  Attempt $i — ${STATUSES:-Pending}"
 
-            if [ "$STATUS" = "Success" ]; then
-              echo "Analytics service deployed successfully"
-              exit 0
-            fi
-
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
-              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
-                --query 'StandardOutputContent' --output text
-              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
-                --query 'StandardErrorContent' --output text
+            if echo "$STATUSES" | grep -E "Failed|TimedOut|Cancelled" > /dev/null 2>&1; then
+              echo "Command failed on one or more instances"
               exit 1
             fi
 
-            [ "$i" = "24" ] && { echo "Timed out waiting for command"; exit 1; }
+            if [ -n "$STATUSES" ] && ! echo "$STATUSES" | grep -E "Pending|InProgress|Waiting|Delayed" > /dev/null 2>&1; then
+              echo "Analytics updated on all instances"
+              exit 0
+            fi
+
+            [ "$i" = "24" ] && { echo "Timed out"; exit 1; }
             sleep 5
           done
